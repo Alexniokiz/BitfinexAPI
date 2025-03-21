@@ -9,10 +9,13 @@ import asyncio
 import aiohttp
 import ssl
 import certifi
-
 def format_amount(amount):
     """Format amount to K/M notation like Bitfinex"""
     abs_amount = abs(float(amount))
+    if abs_amount >= 1_000_000:
+        return f"{abs_amount/1_000_000:.3f}M"
+    elif abs_amount >= 1_000:
+        return f"{abs_amount/1_000:.3f}K" 
     return f"{abs_amount:.3f}"
 
 def format_period_range(periods):
@@ -120,8 +123,8 @@ def fetch_funding_orderbook():
                 try:
                     rate = float(order_data[0]) * 100  # Convert to percentage
                     period = int(order_data[1])
-                    amount = float(order_data[2])  # Keep original sign
-                    num_orders = float(order_data[3])
+                    amount = float(order_data[3])  # Keep original sign
+                    num_orders = float(order_data[2])
                     
                     order = {
                         'Rate': rate,
@@ -153,8 +156,8 @@ def fetch_funding_orderbook():
         df_grouped = df_grouped.rename(columns={'Period': 'Periods'})
         
         # Split into bids and asks based on Amount sign
-        bids_df = df_grouped[df_grouped['Orders'] > 0].copy()
-        asks_df = df_grouped[df_grouped['Orders'] < 0].copy()
+        bids_df = df_grouped[df_grouped['Amount'] > 0].copy()
+        asks_df = df_grouped[df_grouped['Amount'] < 0].copy()
         
         # Sort appropriately (bids descending, asks ascending by rate)
         bids_df = bids_df.sort_values('Rate', ascending=True)
