@@ -9,6 +9,15 @@ import asyncio
 import aiohttp
 import ssl
 import certifi
+import json
+import uuid
+
+# Initialize session state for alerts if not exists
+if 'alerts' not in st.session_state:
+    st.session_state.alerts = {}  # Dictionary to store active alerts
+if 'triggered_alerts' not in st.session_state:
+    st.session_state.triggered_alerts = set()  # Set to track triggered alerts
+
 def format_amount(amount):
     """Format amount to K/M notation like Bitfinex"""
     abs_amount = abs(float(amount))
@@ -243,8 +252,98 @@ def main():
         div[data-testid="stMetricLabel"] {
             color: #7f8c8d;
         }
+        .alert {
+            background-color: #ff3b69;
+            color: white;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            animation: blink 1s infinite;
+            position: relative;
+            padding-right: 30px;
+        }
+        .alert-close {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            cursor: pointer;
+            color: white;
+            font-weight: bold;
+            text-decoration: none;
+        }
+        .alert-close:hover {
+            color: #ddd;
+        }
+        .alert-container {
+            max-height: 200px;
+            overflow-y: auto;
+            margin-bottom: 10px;
+        }
+        @keyframes blink {
+            50% { opacity: 0.5; }
+        }
         </style>
+        
+        <!-- Add sound element -->
+        <audio id="alert-sound" preload="auto">
+            <source src="data:audio/mpeg;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAADAAAGhgBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVWqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqr///////////////////////////////////////////8AAAA5TEFNRTMuOTlyAc0AAAAAAAAAABSAJAOkQgAAgAAABobXZzfKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//sQxAADwAABpAAAACAAADSAAAAETEFNRTMuOTkuNVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=" type="audio/mpeg">
+        </audio>
+        
+        <script>
+        function playAlertSound() {
+            document.getElementById('alert-sound').play();
+        }
+        </script>
     """, unsafe_allow_html=True)
+    
+    # Add alert settings in a collapsible section
+    with st.expander("Alert Settings"):
+        col_rate, col_amount, col_name = st.columns(3)
+        with col_rate:
+            alert_rate = st.number_input("Alert Rate (%)", 
+                                       min_value=0.0, 
+                                       max_value=100.0, 
+                                       value=0.2, 
+                                       step=0.01,
+                                       format="%.3f")
+        with col_amount:
+            alert_amount = st.number_input("Target Amount (M$)", 
+                                         min_value=0.0, 
+                                         max_value=1000.0, 
+                                         value=5.0, 
+                                         step=0.1,
+                                         format="%.1f")
+        with col_name:
+            alert_name = st.text_input("Alert Name (optional)", value="")
+        
+        col_enabled, col_add = st.columns([1, 4])
+        with col_enabled:
+            alert_enabled = st.checkbox("Enable Alerts", value=True)
+        with col_add:
+            if st.button("Add Alert"):
+                if alert_name in st.session_state.alerts:
+                    st.warning(f"Alert with name '{alert_name}' already exists!")
+                else:
+                    alert_id = str(uuid.uuid4())
+                    st.session_state.alerts[alert_id] = {
+                        'name': alert_name or f"Alert {len(st.session_state.alerts) + 1}",
+                        'rate': alert_rate,
+                        'amount': alert_amount
+                    }
+                    st.success("Alert added successfully!")
+    
+    # Display active alerts
+    if st.session_state.alerts:
+        st.markdown("### Active Alerts")
+        for alert_id, alert in list(st.session_state.alerts.items()):
+            col1, col2, col3 = st.columns([3, 1, 1])
+            with col1:
+                st.write(f"**{alert['name']}**: {alert['rate']}% @ {alert['amount']}M$")
+            with col3:
+                if st.button("Delete", key=f"delete_{alert_id}"):
+                    del st.session_state.alerts[alert_id]
+                    st.rerun()
     
     # Add auto-refresh option with custom styling
     col_refresh = st.columns([1, 8])[0]
@@ -252,6 +351,7 @@ def main():
         auto_refresh = st.checkbox("Auto-refresh", value=True)
     
     # Create placeholder containers
+    alert_placeholder = st.empty()
     time_placeholder = st.empty()
     col1, col2 = st.columns(2)
     
@@ -279,6 +379,48 @@ def main():
                 f'<p style="color: #7f8c8d; font-size: 12px; text-align: right;">Last updated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>',
                 unsafe_allow_html=True
             )
+            
+            # Check for alerts if enabled and there are active alerts
+            if alert_enabled and st.session_state.alerts:
+                alert_messages = []
+                play_sound = False
+                
+                # Check each alert
+                for alert_id, alert in st.session_state.alerts.items():
+                    # Check bids at or below the target rate
+                    matching_bids = bids_df[bids_df['Rate'] <= alert['rate']]
+                    if not matching_bids.empty:
+                        # Get the total amount at this rate level
+                        rate_index = bids_df['Rate'].le(alert['rate']).idxmax()
+                        total_at_rate = bids_df.loc[rate_index, 'Cumulative'] / 1_000_000  # Convert to millions
+                        
+                        if total_at_rate >= alert['amount']:
+                            alert_key = f"{alert_id}_{total_at_rate:.1f}"
+                            if alert_key not in st.session_state.triggered_alerts:
+                                play_sound = True
+                                st.session_state.triggered_alerts.add(alert_key)
+                            
+                            alert_messages.append({
+                                'id': alert_key,
+                                'message': f"🔔 {alert['name']}: Total bid amount {total_at_rate:.1f}M$ at {alert['rate']:.3f}% or lower"
+                            })
+                
+                # Display alerts with close buttons
+                if alert_messages:
+                    alert_html = '<div class="alert-container">'
+                    for alert in alert_messages:
+                        alert_html += f'''
+                            <div class="alert" id="{alert['id']}">
+                                {alert['message']}
+                                <a href="#" class="alert-close" onclick="this.parentElement.style.display='none'; return false;">×</a>
+                            </div>
+                        '''
+                    alert_html += '</div>'
+                    if play_sound:
+                        alert_html += '<script>playAlertSound();</script>'
+                    alert_placeholder.markdown(alert_html, unsafe_allow_html=True)
+                else:
+                    alert_placeholder.empty()
             
             # Create styled displays for bids and asks
             bids_display = create_orderbook_display(bids_df, is_bids=True)
