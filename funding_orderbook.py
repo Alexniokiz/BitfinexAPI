@@ -1,62 +1,150 @@
 import ccxt
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 from datetime import datetime
 import time
 import requests
+import asyncio
+import aiohttp
+import ssl
+import certifi
+
+def format_amount(amount):
+    """Format amount to K/M notation like Bitfinex"""
+    abs_amount = abs(float(amount))
+    if abs_amount >= 1_000_000:
+        return f"{abs_amount/1_000_000:.3f}M"
+    elif abs_amount >= 1_000:
+        return f"{abs_amount/1_000:.3f}K"
+    else:
+        return f"{abs_amount:.3f}"
+
+def create_orderbook_display(df, is_bids=True):
+    """Create a styled DataFrame with horizontal bars for cumulative amounts"""
+    if df is None or df.empty:
+        return None
+    
+    # Calculate the maximum cumulative value for scaling
+    max_cumulative = max(df['Cumulative'].max(), 1)  # Avoid division by zero
+    
+    # Create the HTML/CSS for the horizontal bars
+    def create_bar(value, color, is_left=False):
+        width = (value / max_cumulative) * 100
+        if is_left:
+            return f'''
+            <div style="position: relative; width: 100%; height: 24px; background-color: rgba(0,0,0,0);">
+                <div style="position: absolute; right: 0; width: {width}%; height: 100%; background-color: {color}; opacity: 0.15;"></div>
+            </div>
+            '''
+        else:
+            return f'''
+            <div style="position: relative; width: 100%; height: 24px; background-color: rgba(0,0,0,0);">
+                <div style="position: absolute; left: 0; width: {width}%; height: 100%; background-color: {color}; opacity: 0.15;"></div>
+            </div>
+            '''
+    
+    # Create a copy of the dataframe for display
+    display_df = df.copy()
+    
+    # Format numeric columns with specific formatting
+    display_df['Rate'] = display_df['Rate'].map(lambda x: f"{x:.6f}")
+    display_df['Amount'] = display_df['Amount'].abs().map(format_amount)
+    display_df['Period'] = display_df['Period'].map(lambda x: f"{int(x)}")
+    display_df['Total'] = display_df['Cumulative'].map(format_amount)
+    
+    # Add the bar column
+    color = "#132833" if is_bids else "#331333"
+    display_df['Bar'] = df['Cumulative'].map(lambda x: create_bar(x, color, is_bids))
+    
+    if is_bids:
+        # Reorder columns for bids (bar on right)
+        display_df = display_df[['Period', 'Amount', 'Total', 'Rate', 'Bar']]
+        display_df.columns = ['PER', 'AMOUNT', 'TOTAL', 'RATE', '']
+    else:
+        # Reorder columns for asks (bar on left)
+        display_df = display_df[['Bar', 'Rate', 'Total', 'Amount', 'Period']]
+        display_df.columns = ['', 'RATE', 'TOTAL', 'AMOUNT', 'PER']
+    
+    return display_df
+
+async def fetch_period_data(session, period):
+    """Fetch funding orderbook data for a specific period"""
+    url = f"https://api-pub.bitfinex.com/v2/book/fUSD/P{period}?len=250"
+    headers = {"accept": "application/json"}
+    try:
+        async with session.get(url, headers=headers) as response:
+            return await response.json()
+    except Exception as e:
+        st.error(f"Error fetching P{period}: {str(e)}")
+        return []
+
+async def fetch_all_periods():
+    """Fetch funding orderbook data for all periods (P0-P4)"""
+    # Create SSL context with certifi certificates
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    conn = aiohttp.TCPConnector(ssl=ssl_context)
+    
+    async with aiohttp.ClientSession(connector=conn) as session:
+        tasks = [fetch_period_data(session, i) for i in range(5)]
+        results = await asyncio.gather(*tasks)
+        return results
 
 def fetch_funding_orderbook():
     try:
-        # Fetch funding stats for fUSD from Bitfinex public API
-        url = "https://api-pub.bitfinex.com/v2/book/fUSD/P0?len=25"
-        headers = {"accept": "application/json"}
-        response = requests.get(url, headers=headers)
-        data = response.json()
-
-        # Check if data is empty or not a list
-        if not data or not isinstance(data, list):
-            st.error("Invalid response from API")
-            return None, None
-    
-        # Convert list of lists to DataFrame
+        # Fetch data from all periods
+        all_data = asyncio.run(fetch_all_periods())
+        
+        # Combine all orders
         orders = []
-        for order_data in data:
-            # Each order is a list of [rate, period, amount, orders]
-            try:
-                rate = float(order_data[0]) * 100  # Convert to percentage
-                period = int(order_data[1])
-                amount = float(order_data[2])
-                num_orders = float(order_data[3])
-                
-                order = {
-                    'Rate': rate,
-                    'Amount': amount,
-                    'Period': period,
-                    'Orders': num_orders
-                }
-                orders.append(order)
-            except (ValueError, TypeError, IndexError) as e:
-                st.error(f"Error parsing order data: {e}")
+        for data in all_data:
+            if not data or not isinstance(data, list):
                 continue
+                
+            for order_data in data:
+                try:
+                    rate = float(order_data[0]) * 100  # Convert to percentage
+                    period = int(order_data[1])
+                    amount = float(order_data[2])  # Keep original sign
+                    num_orders = float(order_data[3])
+                    
+                    order = {
+                        'Rate': rate,
+                        'Amount': amount,
+                        'Period': period,
+                        'Orders': num_orders
+                    }
+                    orders.append(order)
+                except (ValueError, TypeError, IndexError) as e:
+                    st.error(f"Error parsing order data: {e}")
+                    continue
         
         # Check if we parsed any valid orders
         if not orders:
-            st.error("No valid orders found in data. Raw data received: " + str(data[:20]))
+            st.error("No valid orders found in data")
             return None, None
             
         # Convert to DataFrame
         df = pd.DataFrame(orders)
         
-        # Split into bids and asks
-        bids_df = df[df['Amount'] > 0].copy()
-        asks_df = df[df['Amount'] < 0].copy()
+        # Group by Rate and sum the Amount and Orders, keeping the sign
+        df_grouped = df.groupby('Rate').agg({
+            'Amount': 'sum',
+            'Orders': 'sum',
+            'Period': 'mean'  # Take average period for the rate
+        }).reset_index()
         
-        # Make amounts positive for asks
-        asks_df['Amount'] = asks_df['Amount'].abs()
+        # Split into bids and asks based on Amount sign
+        bids_df = df_grouped[df_grouped['Orders'] > 0].copy()
+        asks_df = df_grouped[df_grouped['Orders'] < 0].copy()
+        
+        # Sort appropriately (bids descending, asks ascending by rate)
+        bids_df = bids_df.sort_values('Rate', ascending=True)
+        asks_df = asks_df.sort_values('Rate', ascending=False)
         
         # Calculate cumulative amounts
         bids_df['Cumulative'] = bids_df['Amount'].cumsum()
-        asks_df['Cumulative'] = asks_df['Amount'].cumsum()
+        asks_df['Cumulative'] = asks_df['Amount'].abs().cumsum()
         
         return bids_df, asks_df
     except Exception as e:
@@ -65,10 +153,72 @@ def fetch_funding_orderbook():
 
 def main():
     st.set_page_config(page_title="Bitfinex fUSD Funding Order Book", layout="wide")
-    st.title("Bitfinex fUSD Funding Order Book")
     
-    # Add auto-refresh option
-    auto_refresh = st.checkbox("Auto-refresh every 5 seconds", value=True)
+    # Custom CSS for Bitfinex-like styling
+    st.markdown("""
+        <style>
+        .stApp {
+            background-color: #1b262d;
+        }
+        div[data-testid="stToolbar"] {
+            display: none;
+        }
+        .stMarkdown {
+            color: #7f8c8d;
+            font-family: monospace;
+        }
+        .dataframe {
+            font-family: "Courier New", Courier, monospace !important;
+            font-size: 13px !important;
+            width: 100% !important;
+            border-collapse: collapse !important;
+            border: none !important;
+        }
+        .dataframe th {
+            background-color: #1b262d !important;
+            color: #7f8c8d !important;
+            font-weight: normal !important;
+            padding: 8px 12px !important;
+            border: none !important;
+            text-align: right !important;
+        }
+        .dataframe td {
+            background-color: #1b262d !important;
+            color: #ffffff !important;
+            padding: 8px 12px !important;
+            border: none !important;
+            text-align: right !important;
+            white-space: nowrap !important;
+        }
+        thead tr {
+            border-bottom: 1px solid #2c3940 !important;
+        }
+        tbody tr:hover {
+            background-color: #232f36 !important;
+        }
+        div[data-testid="stHeader"] {
+            display: none;
+        }
+        section[data-testid="stSidebar"] {
+            display: none;
+        }
+        div.stTitle {
+            display: none;
+        }
+        div[data-testid="stMetricValue"] {
+            color: #ffffff;
+            font-family: monospace;
+        }
+        div[data-testid="stMetricLabel"] {
+            color: #7f8c8d;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # Add auto-refresh option with custom styling
+    col_refresh = st.columns([1, 8])[0]
+    with col_refresh:
+        auto_refresh = st.checkbox("Auto-refresh", value=True)
     
     # Create placeholder containers
     time_placeholder = st.empty()
@@ -76,15 +226,14 @@ def main():
     
     # Create placeholders for dataframes
     with col1:
-        st.subheader("Bids (Buy Orders)")
+        st.markdown('<p style="color: #7f8c8d; margin-bottom: 5px; font-size: 14px;">BIDS</p>', unsafe_allow_html=True)
         bids_placeholder = st.empty()
     
     with col2:
-        st.subheader("Asks (Sell Orders)")
+        st.markdown('<p style="color: #7f8c8d; margin-bottom: 5px; font-size: 14px;">ASKS</p>', unsafe_allow_html=True)
         asks_placeholder = st.empty()
     
     # Create placeholders for statistics
-    st.subheader("Order Book Statistics")
     stat_col1, stat_col2, stat_col3 = st.columns(3)
     bid_metric = stat_col1.empty()
     ask_metric = stat_col2.empty()
@@ -95,30 +244,27 @@ def main():
         
         if bids_df is not None and asks_df is not None:
             # Update current time
-            time_placeholder.write(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            time_placeholder.markdown(
+                f'<p style="color: #7f8c8d; font-size: 12px; text-align: right;">Last updated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>',
+                unsafe_allow_html=True
+            )
             
-            # Update the order book data
-            bids_placeholder.dataframe(bids_df.style.format({
-                'Rate': '{:.4f}',
-                'Amount': '{:.2f}',
-                'Period': '{:d}',
-                'Orders': '{:.2f}',
-                'Cumulative': '{:.2f}'
-            }))
+            # Create styled displays for bids and asks
+            bids_display = create_orderbook_display(bids_df, is_bids=True)
+            asks_display = create_orderbook_display(asks_df, is_bids=False)
             
-            asks_placeholder.dataframe(asks_df.style.format({
-                'Rate': '{:.4f}',
-                'Amount': '{:.2f}',
-                'Period': '{:d}',
-                'Orders': '{:.2f}',
-                'Cumulative': '{:.2f}'
-            }))
+            # Display the styled dataframes
+            if bids_display is not None:
+                bids_placeholder.write(bids_display.to_html(escape=False, index=False), unsafe_allow_html=True)
+            
+            if asks_display is not None:
+                asks_placeholder.write(asks_display.to_html(escape=False, index=False), unsafe_allow_html=True)
             
             # Update statistics
-            bid_metric.metric("Best Bid Rate", f"{bids_df['Rate'].max():.4f}%")
-            ask_metric.metric("Best Ask Rate", f"{asks_df['Rate'].min():.4f}%")
+            bid_metric.metric("Best Bid Rate", f"{bids_df['Rate'].max():.6f}%")
+            ask_metric.metric("Best Ask Rate", f"{asks_df['Rate'].min():.6f}%")
             spread = asks_df['Rate'].min() - bids_df['Rate'].max()
-            spread_metric.metric("Spread", f"{spread:.4f}%")
+            spread_metric.metric("Spread", f"{spread:.6f}%")
         
         if not auto_refresh:
             break
