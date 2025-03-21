@@ -13,60 +13,75 @@ import certifi
 def format_amount(amount):
     """Format amount to K/M notation like Bitfinex"""
     abs_amount = abs(float(amount))
-    if abs_amount >= 1_000_000:
-        return f"{abs_amount/1_000_000:.3f}M"
-    elif abs_amount >= 1_000:
-        return f"{abs_amount/1_000:.3f}K"
-    else:
-        return f"{abs_amount:.3f}"
+    return f"{abs_amount:.3f}"
+
+def format_period_range(periods):
+    """Format period range from list of periods"""
+    if not periods:
+        return ""
+    periods = sorted(list(set(periods)))  # Remove duplicates and sort
+    if len(periods) == 1:
+        return str(periods[0])
+    return f"{min(periods)}-{max(periods)}"
 
 def create_orderbook_display(df, is_bids=True):
-    """Create a styled DataFrame with horizontal bars for cumulative amounts"""
+    """Create a styled DataFrame with a background gradient starting from the inner side of the row"""
     if df is None or df.empty:
         return None
-    
-    # Calculate the maximum cumulative value for scaling
-    max_cumulative = max(df['Cumulative'].max(), 1)  # Avoid division by zero
-    
-    # Create the HTML/CSS for the horizontal bars
-    def create_bar(value, color, is_left=False):
-        width = (value / max_cumulative) * 100
-        if is_left:
-            return f'''
-            <div style="position: relative; width: 100%; height: 24px; background-color: rgba(0,0,0,0);">
-                <div style="position: absolute; right: 0; width: {width}%; height: 100%; background-color: {color}; opacity: 0.15;"></div>
-            </div>
-            '''
-        else:
-            return f'''
-            <div style="position: relative; width: 100%; height: 24px; background-color: rgba(0,0,0,0);">
-                <div style="position: absolute; left: 0; width: {width}%; height: 100%; background-color: {color}; opacity: 0.15;"></div>
-            </div>
-            '''
-    
-    # Create a copy of the dataframe for display
+
+    # Calculate the maximum cumulative value for scaling (avoid division by zero)
+    max_cumulative = max(df['Cumulative'].max(), 1)
+
+    # Create a copy for display and format columns
     display_df = df.copy()
-    
-    # Format numeric columns with specific formatting
     display_df['Rate'] = display_df['Rate'].map(lambda x: f"{x:.6f}")
     display_df['Amount'] = display_df['Amount'].abs().map(format_amount)
-    display_df['Period'] = display_df['Period'].map(lambda x: f"{int(x)}")
+    display_df['Period'] = display_df['Periods'].map(format_period_range)
     display_df['Total'] = display_df['Cumulative'].map(format_amount)
-    
-    # Add the bar column
-    color = "#132833" if is_bids else "#331333"
-    display_df['Bar'] = df['Cumulative'].map(lambda x: create_bar(x, color, is_bids))
-    
+
+    # Set column order and display names based on order type
     if is_bids:
-        # Reorder columns for bids (bar on right)
-        display_df = display_df[['Period', 'Amount', 'Total', 'Rate', 'Bar']]
-        display_df.columns = ['PER', 'AMOUNT', 'TOTAL', 'RATE', '']
+        columns = ['Period', 'Amount', 'Total', 'Rate']
+        display_names = ['PER', 'AMOUNT', 'TOTAL', 'RATE']
     else:
-        # Reorder columns for asks (bar on left)
-        display_df = display_df[['Bar', 'Rate', 'Total', 'Amount', 'Period']]
-        display_df.columns = ['', 'RATE', 'TOTAL', 'AMOUNT', 'PER']
+        columns = ['Rate', 'Total', 'Amount', 'Period']
+        display_names = ['RATE', 'TOTAL', 'AMOUNT', 'PER']
     
-    return display_df
+    # Map the columns to new display names
+    col_mapping = dict(zip(columns, display_names))
+    final_df = display_df[columns].rename(columns=col_mapping)
+
+    # Choose color (red for bids, green for asks)
+    color = "#ff3b69" if is_bids else "#26a69a"
+
+    # Start building the HTML table
+    html = '<table class="dataframe">'
+    # Header
+    html += '<thead><tr>'
+    for col in final_df.columns:
+        html += f'<th>{col}</th>'
+    html += '</tr></thead>'
+
+    # Body: for each row, compute the cumulative percentage and apply a background gradient
+    html += '<tbody>'
+    for _, row in display_df.iterrows():
+        # Compute fill percentage relative to the maximum cumulative value
+        fill_percent = (row['Cumulative'] / max_cumulative) * 100
+
+        # For bids, the gradient starts from the right (inside) and for asks from the left (inside)
+        if is_bids:
+            gradient = f"linear-gradient(to left, {color} {fill_percent}%, transparent {fill_percent}%)"
+        else:
+            gradient = f"linear-gradient(to right, {color} {fill_percent}%, transparent {fill_percent}%)"
+        
+        html += f'<tr style="background: {gradient};">'
+        for col in columns:
+            html += f'<td>{row[col]}</td>'
+        html += '</tr>'
+    html += '</tbody></table>'
+
+    return html
+
 
 async def fetch_period_data(session, period):
     """Fetch funding orderbook data for a specific period"""
@@ -127,12 +142,15 @@ def fetch_funding_orderbook():
         # Convert to DataFrame
         df = pd.DataFrame(orders)
         
-        # Group by Rate and sum the Amount and Orders, keeping the sign
+        # Group by Rate and collect all periods and sum amounts
         df_grouped = df.groupby('Rate').agg({
             'Amount': 'sum',
             'Orders': 'sum',
-            'Period': 'mean'  # Take average period for the rate
+            'Period': lambda x: list(x)  # Collect all periods
         }).reset_index()
+        
+        # Rename Period column to Periods for clarity
+        df_grouped = df_grouped.rename(columns={'Period': 'Periods'})
         
         # Split into bids and asks based on Amount sign
         bids_df = df_grouped[df_grouped['Orders'] > 0].copy()
@@ -173,6 +191,7 @@ def main():
             width: 100% !important;
             border-collapse: collapse !important;
             border: none !important;
+            position: relative !important;
         }
         .dataframe th {
             background-color: #1b262d !important;
@@ -181,14 +200,23 @@ def main():
             padding: 8px 12px !important;
             border: none !important;
             text-align: right !important;
+            position: relative !important;
+            z-index: 2 !important;
         }
         .dataframe td {
-            background-color: #1b262d !important;
+            background-color: transparent !important;
             color: #ffffff !important;
             padding: 8px 12px !important;
             border: none !important;
             text-align: right !important;
             white-space: nowrap !important;
+            position: relative !important;
+            height: 24px !important;
+            z-index: 2 !important;
+        }
+        .dataframe tr {
+            position: relative !important;
+            height: 24px !important;
         }
         thead tr {
             border-bottom: 1px solid #2c3940 !important;
@@ -255,10 +283,10 @@ def main():
             
             # Display the styled dataframes
             if bids_display is not None:
-                bids_placeholder.write(bids_display.to_html(escape=False, index=False), unsafe_allow_html=True)
+                bids_placeholder.write(bids_display, unsafe_allow_html=True)
             
             if asks_display is not None:
-                asks_placeholder.write(asks_display.to_html(escape=False, index=False), unsafe_allow_html=True)
+                asks_placeholder.write(asks_display, unsafe_allow_html=True)
             
             # Update statistics
             bid_metric.metric("Best Bid Rate", f"{bids_df['Rate'].max():.6f}%")
