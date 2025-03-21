@@ -11,12 +11,32 @@ import ssl
 import certifi
 import json
 import uuid
+from streamlit_cookies_manager import EncryptedCookieManager
 
-# Initialize session state for alerts if not exists
+# Set page config must be the first Streamlit command
+st.set_page_config(page_title="Bitfinex fUSD Funding Order Book", layout="wide")
+
+# Initialize cookie manager (it uses an encrypted cookie store)
+cookie_manager = EncryptedCookieManager(
+    prefix="bitfinex_",
+    password="7x!A9yZ#mP2$qR5v"  # Added secure password
+)
+if not cookie_manager.ready():
+    st.stop()  # Wait until the cookie manager is ready
+
+# Initialize session state for alerts if not exists.
 if 'alerts' not in st.session_state:
-    st.session_state.alerts = {}  # Dictionary to store active alerts
+    alerts_cookie = cookie_manager.get("alerts")
+    if alerts_cookie:
+        try:
+            st.session_state.alerts = json.loads(alerts_cookie)
+        except Exception as e:
+            st.session_state.alerts = {}
+    else:
+        st.session_state.alerts = {}
+
 if 'triggered_alerts' not in st.session_state:
-    st.session_state.triggered_alerts = set()  # Set to track triggered alerts
+    st.session_state.triggered_alerts = set()
 
 def format_amount(amount):
     """Format amount to K/M notation like Bitfinex"""
@@ -35,6 +55,89 @@ def format_period_range(periods):
     if len(periods) == 1:
         return str(periods[0])
     return f"{min(periods)}-{max(periods)}"
+
+def fetch_period_data_sync(period):
+    """Fetch funding orderbook data for a specific period synchronously"""
+    url = f"https://api-pub.bitfinex.com/v2/book/fUSD/P{period}?len=250"
+    headers = {"accept": "application/json"}
+    try:
+        response = requests.get(url, headers=headers)
+        return response.json()
+    except Exception as e:
+        st.error(f"Error fetching P{period}: {str(e)}")
+        return []
+
+def fetch_all_periods_sync():
+    """Fetch funding orderbook data for all periods (P0-P4) synchronously"""
+    results = []
+    for i in range(5):
+        result = fetch_period_data_sync(i)
+        results.append(result)
+    return results
+
+def fetch_funding_orderbook():
+    try:
+        # Fetch data from all periods
+        all_data = fetch_all_periods_sync()
+        
+        # Combine all orders
+        orders = []
+        for data in all_data:
+            if not data or not isinstance(data, list):
+                continue
+                
+            for order_data in data:
+                try:
+                    rate = float(order_data[0]) * 100  # Convert to percentage
+                    period = int(order_data[1])
+                    amount = float(order_data[3])  # Keep original sign
+                    num_orders = float(order_data[2])
+                    
+                    order = {
+                        'Rate': rate,
+                        'Amount': amount,
+                        'Period': period,
+                        'Orders': num_orders
+                    }
+                    orders.append(order)
+                except (ValueError, TypeError, IndexError) as e:
+                    st.error(f"Error parsing order data: {e}")
+                    continue
+        
+        # Check if we parsed any valid orders
+        if not orders:
+            st.error("No valid orders found in data")
+            return None, None
+            
+        # Convert to DataFrame
+        df = pd.DataFrame(orders)
+        
+        # Group by Rate and collect all periods and sum amounts
+        df_grouped = df.groupby('Rate').agg({
+            'Amount': 'sum',
+            'Orders': 'sum',
+            'Period': lambda x: list(x)  # Collect all periods
+        }).reset_index()
+        
+        # Rename Period column to Periods for clarity
+        df_grouped = df_grouped.rename(columns={'Period': 'Periods'})
+        
+        # Split into bids and asks based on Amount sign
+        bids_df = df_grouped[df_grouped['Amount'] > 0].copy()
+        asks_df = df_grouped[df_grouped['Amount'] < 0].copy()
+        
+        # Sort appropriately (bids ascending, asks descending by rate)
+        bids_df = bids_df.sort_values('Rate', ascending=True)
+        asks_df = asks_df.sort_values('Rate', ascending=False)
+        
+        # Calculate cumulative amounts
+        bids_df['Cumulative'] = bids_df['Amount'].cumsum()
+        asks_df['Cumulative'] = asks_df['Amount'].abs().cumsum()
+        
+        return bids_df, asks_df
+    except Exception as e:
+        st.error(f"Error fetching order book: {str(e)}")
+        return None, None
 
 def create_orderbook_display(df, is_bids=True):
     """Create a styled DataFrame with a background gradient starting from the inner side of the row"""
@@ -94,97 +197,8 @@ def create_orderbook_display(df, is_bids=True):
 
     return html
 
-
-async def fetch_period_data(session, period):
-    """Fetch funding orderbook data for a specific period"""
-    url = f"https://api-pub.bitfinex.com/v2/book/fUSD/P{period}?len=250"
-    headers = {"accept": "application/json"}
-    try:
-        async with session.get(url, headers=headers) as response:
-            return await response.json()
-    except Exception as e:
-        st.error(f"Error fetching P{period}: {str(e)}")
-        return []
-
-async def fetch_all_periods():
-    """Fetch funding orderbook data for all periods (P0-P4)"""
-    # Create SSL context with certifi certificates
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
-    conn = aiohttp.TCPConnector(ssl=ssl_context)
-    
-    async with aiohttp.ClientSession(connector=conn) as session:
-        tasks = [fetch_period_data(session, i) for i in range(5)]
-        results = await asyncio.gather(*tasks)
-        return results
-
-def fetch_funding_orderbook():
-    try:
-        # Fetch data from all periods
-        all_data = asyncio.run(fetch_all_periods())
-        
-        # Combine all orders
-        orders = []
-        for data in all_data:
-            if not data or not isinstance(data, list):
-                continue
-                
-            for order_data in data:
-                try:
-                    rate = float(order_data[0]) * 100  # Convert to percentage
-                    period = int(order_data[1])
-                    amount = float(order_data[3])  # Keep original sign
-                    num_orders = float(order_data[2])
-                    
-                    order = {
-                        'Rate': rate,
-                        'Amount': amount,
-                        'Period': period,
-                        'Orders': num_orders
-                    }
-                    orders.append(order)
-                except (ValueError, TypeError, IndexError) as e:
-                    st.error(f"Error parsing order data: {e}")
-                    continue
-        
-        # Check if we parsed any valid orders
-        if not orders:
-            st.error("No valid orders found in data")
-            return None, None
-            
-        # Convert to DataFrame
-        df = pd.DataFrame(orders)
-        
-        # Group by Rate and collect all periods and sum amounts
-        df_grouped = df.groupby('Rate').agg({
-            'Amount': 'sum',
-            'Orders': 'sum',
-            'Period': lambda x: list(x)  # Collect all periods
-        }).reset_index()
-        
-        # Rename Period column to Periods for clarity
-        df_grouped = df_grouped.rename(columns={'Period': 'Periods'})
-        
-        # Split into bids and asks based on Amount sign
-        bids_df = df_grouped[df_grouped['Amount'] > 0].copy()
-        asks_df = df_grouped[df_grouped['Amount'] < 0].copy()
-        
-        # Sort appropriately (bids descending, asks ascending by rate)
-        bids_df = bids_df.sort_values('Rate', ascending=True)
-        asks_df = asks_df.sort_values('Rate', ascending=False)
-        
-        # Calculate cumulative amounts
-        bids_df['Cumulative'] = bids_df['Amount'].cumsum()
-        asks_df['Cumulative'] = asks_df['Amount'].abs().cumsum()
-        
-        return bids_df, asks_df
-    except Exception as e:
-        st.error(f"Error fetching order book: {str(e)}")
-        return None, None
-
 def main():
-    st.set_page_config(page_title="Bitfinex fUSD Funding Order Book", layout="wide")
-    
-    # Custom CSS for Bitfinex-like styling
+    # Custom CSS for Bitfinex-like styling and alert display
     st.markdown("""
         <style>
         .stApp {
@@ -287,7 +301,7 @@ def main():
         
         <!-- Add sound element -->
         <audio id="alert-sound" preload="auto">
-            <source src="data:audio/mpeg;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAADAAAGhgBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVWqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqr///////////////////////////////////////////8AAAA5TEFNRTMuOTlyAc0AAAAAAAAAABSAJAOkQgAAgAAABobXZzfKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//sQxAADwAABpAAAACAAADSAAAAETEFNRTMuOTkuNVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=" type="audio/mpeg">
+            <source src="data:audio/mpeg;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAADAAAGhgBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVWqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqr///////////////////////////////////////////8AAAA5TEFNRTMuOTlyAc0AAAAAAAAAABSAJAOkQgAAgAAABobXZzfKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//sQxAADwAABpAAAACAAADSAAAAETEFNRTMuOTkuNVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=" type="audio/mpeg">
         </audio>
         
         <script>
@@ -326,11 +340,15 @@ def main():
                     st.warning(f"Alert with name '{alert_name}' already exists!")
                 else:
                     alert_id = str(uuid.uuid4())
-                    st.session_state.alerts[alert_id] = {
+                    new_alert = {
                         'name': alert_name or f"Alert {len(st.session_state.alerts) + 1}",
                         'rate': alert_rate,
                         'amount': alert_amount
                     }
+                    st.session_state.alerts[alert_id] = new_alert
+                    # Save alerts to cookies
+                    cookie_manager["alerts"] = json.dumps(st.session_state.alerts)
+                    cookie_manager.save()
                     st.success("Alert added successfully!")
     
     # Display active alerts
@@ -343,14 +361,17 @@ def main():
             with col3:
                 if st.button("Delete", key=f"delete_{alert_id}"):
                     del st.session_state.alerts[alert_id]
-                    st.rerun()
+                    # Update cookies after deletion
+                    cookie_manager["alerts"] = json.dumps(st.session_state.alerts)
+                    cookie_manager.save()
+                    st.experimental_rerun()
     
     # Add auto-refresh option with custom styling
     col_refresh = st.columns([1, 8])[0]
     with col_refresh:
         auto_refresh = st.checkbox("Auto-refresh", value=True)
     
-    # Create placeholder containers
+    # Create placeholder containers for alerts, time and orderbook displays
     alert_placeholder = st.empty()
     time_placeholder = st.empty()
     col1, col2 = st.columns(2)
@@ -385,14 +406,13 @@ def main():
                 alert_messages = []
                 play_sound = False
                 
-                # Check each alert
+                # Check each alert (example: check bids at or below the target rate)
                 for alert_id, alert in st.session_state.alerts.items():
-                    # Check bids at or below the target rate
                     matching_bids = bids_df[bids_df['Rate'] <= alert['rate']]
                     if not matching_bids.empty:
-                        # Get the total amount at this rate level
+                        # Get the cumulative amount at the first matching rate level
                         rate_index = bids_df['Rate'].le(alert['rate']).idxmax()
-                        total_at_rate = bids_df.loc[rate_index, 'Cumulative'] / 1_000_000  # Convert to millions
+                        total_at_rate = bids_df.loc[rate_index, 'Cumulative'] / 1_000_000  # in millions
                         
                         if total_at_rate >= alert['amount']:
                             alert_key = f"{alert_id}_{total_at_rate:.1f}"
@@ -445,4 +465,4 @@ def main():
         time.sleep(5)
 
 if __name__ == "__main__":
-    main() 
+    main()
