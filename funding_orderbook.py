@@ -70,9 +70,8 @@ def fetch_period_data_sync(period):
 def fetch_all_periods_sync():
     """Fetch funding orderbook data for all periods (P0-P4) synchronously"""
     results = []
-    for i in range(5):
-        result = fetch_period_data_sync(i)
-        results.append(result)
+    result = fetch_period_data_sync(0)
+    results.append(result)
     return results
 
 @st.cache_data(ttl=5000)
