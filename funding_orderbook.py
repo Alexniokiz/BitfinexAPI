@@ -299,14 +299,37 @@ def main():
         }
         </style>
         
-        <!-- Add sound element -->
+        <!-- Add sound element with a more reliable audio source -->
         <audio id="alert-sound" preload="auto">
-            <source src="data:audio/mpeg;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAADAAAGhgBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVWqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqr///////////////////////////////////////////8AAAA5TEFNRTMuOTlyAc0AAAAAAAAAABSAJAOkQgAAgAAABobXZzfKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//sQxAADwAABpAAAACAAADSAAAAETEFNRTMuOTkuNVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=" type="audio/mpeg">
+            <source src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3" type="audio/mpeg">
+            Your browser does not support the audio element.
         </audio>
         
         <script>
         function playAlertSound() {
-            document.getElementById('alert-sound').play();
+            const audio = document.getElementById('alert-sound');
+            audio.currentTime = 0; // Reset the audio to start
+            audio.volume = 1.0; // Set volume to maximum
+            const playPromise = audio.play();
+            
+            if (playPromise !== undefined) {
+                playPromise.then(_ => {
+                    console.log('Alert sound played successfully');
+                })
+                .catch(error => {
+                    console.error('Error playing alert sound:', error);
+                });
+            }
+        }
+
+        // Add a function to check if sound is enabled
+        function isSoundEnabled() {
+            return localStorage.getItem('bitfinex_sound_enabled') !== 'false';
+        }
+
+        // Add a function to toggle sound
+        function toggleSound(enabled) {
+            localStorage.setItem('bitfinex_sound_enabled', enabled);
         }
         </script>
     """, unsafe_allow_html=True)
@@ -346,10 +369,18 @@ def main():
                         'amount': alert_amount
                     }
                     st.session_state.alerts[alert_id] = new_alert
-                    # Save alerts to cookies
+                    # Save to cookies
                     cookie_manager["alerts"] = json.dumps(st.session_state.alerts)
                     cookie_manager.save()
                     st.success("Alert added successfully!")
+        
+        # Add sound toggle
+        sound_enabled = st.checkbox("Enable Sound", value=True, key="sound_enabled")
+        st.markdown(f"""
+            <script>
+            toggleSound({str(sound_enabled).lower()});
+            </script>
+        """, unsafe_allow_html=True)
     
     # Display active alerts
     if st.session_state.alerts:
@@ -401,31 +432,46 @@ def main():
                 unsafe_allow_html=True
             )
             
-            # Check for alerts if enabled and there are active alerts
+                        # --- ALERT CHECKING: BIDS BELOW ALERT RATE ONLY ---
             if alert_enabled and st.session_state.alerts:
                 alert_messages = []
                 play_sound = False
-                
-                # Check each alert (example: check bids at or below the target rate)
+
                 for alert_id, alert in st.session_state.alerts.items():
-                    matching_bids = bids_df[bids_df['Rate'] <= alert['rate']]
-                    if not matching_bids.empty:
-                        # Get the cumulative amount at the first matching rate level
-                        rate_index = bids_df['Rate'].le(alert['rate']).idxmax()
-                        total_at_rate = bids_df.loc[rate_index, 'Cumulative'] / 1_000_000  # in millions
-                        
-                        if total_at_rate >= alert['amount']:
-                            alert_key = f"{alert_id}_{total_at_rate:.1f}"
-                            if alert_key not in st.session_state.triggered_alerts:
-                                play_sound = True
-                                st.session_state.triggered_alerts.add(alert_key)
-                            
-                            alert_messages.append({
-                                'id': alert_key,
-                                'message': f"🔔 {alert['name']}: Total bid amount {total_at_rate:.1f}M$ at {alert['rate']:.3f}% or lower"
-                            })
-                
-                # Display alerts with close buttons
+                    # Filter bids with rates strictly below the alert rate
+                    good_bids = bids_df[bids_df['Rate'] < alert['rate']]
+                    if good_bids.empty:
+                        cumulative_bid = 0.0
+                        effective_rate_bid = None
+                    else:
+                        # Sum the liquidity of these bids (converted to millions)
+                        cumulative_bid = good_bids['Amount'].sum() / 1_000_000
+                        # Choose the best (highest) rate among bids below the alert rate
+                        effective_rate_bid = good_bids['Rate'].max()
+
+                    # Calculate progress as a percentage toward the target liquidity
+
+                    if cumulative_bid < alert['amount']:
+                        # Not enough liquidity available at rates below the alert threshold → trigger the alarm.
+                        alarm_message = (f"🔔 {alert['name']}: Only {cumulative_bid:.1f}M$ available at bid rates below "
+                                         f"{alert['rate']:.3f}% (target: {alert['amount']:.1f}M$)")
+                        if effective_rate_bid is not None:
+                            alarm_message += f" (Best bid: {effective_rate_bid:.3f}%)"
+                        message = alarm_message
+
+                        alert_key = f"{alert_id}_{cumulative_bid:.1f}"
+                        if alert_key not in st.session_state.triggered_alerts:
+                            play_sound = True
+                            st.session_state.triggered_alerts.add(alert_key)
+                        alert_messages.append({'id': alert_key, 'message': message})
+                    else:
+                        # Sufficient liquidity exists below the alert rate: display confirmation with progress.
+                        message = (f"✅ {alert['name']}: Sufficient liquidity available: {cumulative_bid:.1f}M$ at bid rates below "
+                                   f"{alert['rate']:.3f}% (target: {alert['amount']:.1f}M$)")
+                        alert_key = f"{alert_id}_complete"
+                        alert_messages.append({'id': alert_key, 'message': message})
+
+                # Display the alert messages with close buttons.
                 if alert_messages:
                     alert_html = '<div class="alert-container">'
                     for alert in alert_messages:
@@ -437,11 +483,19 @@ def main():
                         '''
                     alert_html += '</div>'
                     if play_sound:
-                        alert_html += '<script>playAlertSound();</script>'
+                        alert_html += '''
+                            <script>
+                            if (isSoundEnabled()) {
+                                playAlertSound();
+                            }
+                            </script>
+                        '''
                     alert_placeholder.markdown(alert_html, unsafe_allow_html=True)
                 else:
                     alert_placeholder.empty()
-            
+
+
+
             # Create styled displays for bids and asks
             bids_display = create_orderbook_display(bids_df, is_bids=True)
             asks_display = create_orderbook_display(asks_df, is_bids=False)
