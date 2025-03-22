@@ -395,7 +395,7 @@ def main():
                     # Update cookies after deletion
                     cookie_manager["alerts"] = json.dumps(st.session_state.alerts)
                     cookie_manager.save()
-                    st.experimental_rerun()
+                    st.rerun()
     
     # Add auto-refresh option with custom styling
     col_refresh = st.columns([1, 8])[0]
